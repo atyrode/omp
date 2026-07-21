@@ -1,0 +1,106 @@
+name: Fork release binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target_id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+            arch: x64
+            variant: baseline
+            glibc: "2.17"
+            target_id: linux-x64
+            binary_path: packages/coding-agent/binaries/omp-linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            variant: ""
+            glibc: "2.17"
+            target_id: linux-arm64
+            binary_path: packages/coding-agent/binaries/omp-linux-arm64
+          - os: macos-15-intel
+            platform: darwin
+            arch: x64
+            variant: baseline
+            glibc: ""
+            target_id: darwin-x64
+            binary_path: packages/coding-agent/binaries/omp-darwin-x64
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+            variant: ""
+            glibc: ""
+            target_id: darwin-arm64
+            binary_path: packages/coding-agent/binaries/omp-darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.release_tag }}
+      - name: Verify release tag points at this source
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
+      - uses: ./.github/actions/build-native
+        with:
+          hash: ${{ github.sha }}
+          platform: ${{ matrix.platform }}
+          arch: ${{ matrix.arch }}
+          variant: ${{ matrix.variant }}
+          glibc: ${{ matrix.glibc }}
+          save_cache: "true"
+      - name: Build release binary
+        env:
+          RELEASE_TARGETS: ${{ matrix.target_id }}
+        run: bun run ci:release:build-binaries
+      - name: Smoke release binary
+        run: |
+          runtime_dir="$(mktemp -d)"
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --version
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --smoke-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omp-binary-${{ matrix.target_id }}
+          path: ${{ matrix.binary_path }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: omp-binary-*
+          path: binaries
+          merge-multiple: true
+      - name: Publish immutable tag assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" binaries/omp-* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" binaries/omp-* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TAG" \
+              --notes "Fork build with immutable per-session OAuth account allowlists."
+          fi
