@@ -10,9 +10,11 @@
 import { scheduler } from "node:timers/promises";
 import { logger } from "@oh-my-pi/pi-utils";
 import {
+	type AuthAccountAllowlist,
 	type AuthCredential,
 	type AuthCredentialSnapshotEntry,
 	type AuthCredentialStore,
+	isCredentialEligible,
 	type OAuthCredential,
 	REMOTE_REFRESH_SENTINEL,
 	type StoredAuthCredential,
@@ -205,17 +207,22 @@ export interface RemoteAuthCredentialStoreOptions {
 	 */
 	streamSnapshots?: boolean;
 	/**
-	 * Called after broker-sourced full snapshots are applied. The constructor's
-	 * initial snapshot intentionally does not trigger this hook.
+	 * Called when broker-sourced full raw snapshots are received, before the
+	 * filtered public view is updated. The constructor's initial snapshot does
+	 * not trigger this hook.
 	 */
 	onSnapshot?: (snapshot: SnapshotResponse, generation: number) => void;
+	/** Immutable per-store OAuth account policy. */
+	accountAllowlist?: AuthAccountAllowlist;
 }
 
 export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	readonly #client: AuthBrokerClient;
 	readonly #streamSnapshots: boolean;
+	readonly #accountAllowlist: AuthAccountAllowlist;
 	readonly #onSnapshot?: (snapshot: SnapshotResponse, generation: number) => void;
 	#snapshot: SnapshotResponse = emptySnapshot();
+	#rawSnapshot: SnapshotResponse = emptySnapshot();
 	#snapshotReceivedAt = Date.now();
 	#generation = 0;
 	#usageOverlays: Map<string, UsageReport> = new Map();
@@ -238,6 +245,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	constructor(opts: RemoteAuthCredentialStoreOptions) {
 		this.#client = opts.client;
+		this.#accountAllowlist = new Map(
+			[...(opts.accountAllowlist ?? new Map<string, ReadonlySet<string>>())].map(([provider, identities]) => [
+				provider,
+				new Set(identities),
+			]),
+		);
 		this.#streamSnapshots = opts.streamSnapshots ?? true;
 		this.#applySnapshot(opts.initialSnapshot ?? emptySnapshot(), opts.initialSnapshot?.generation ?? 0);
 		this.#onSnapshot = opts.onSnapshot;
@@ -253,21 +266,32 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	#applySnapshot(snapshot: SnapshotResponse, generation: number, protectNewBlocks = true): void {
+		this.#rawSnapshot = snapshot;
+		const onSnapshot = this.#onSnapshot;
+		if (onSnapshot) {
+			try {
+				onSnapshot(this.#rawSnapshot, generation);
+			} catch (error) {
+				logger.debug("auth-broker snapshot callback failed", { error: String(error) });
+			}
+		}
 		const nowMs = Date.now();
 		const previousCredentials = this.#snapshot.credentials;
-		const credentials = snapshot.credentials.map(entry => this.#normalizeSnapshotEntryBlocks(entry, nowMs));
+		const credentials = snapshot.credentials
+			.filter(entry =>
+				isCredentialEligible(
+					entry.provider,
+					entry.credential as AuthCredential,
+					this.#accountAllowlist,
+					entry.identityKey,
+				),
+			)
+			.map(entry => this.#normalizeSnapshotEntryBlocks(entry, nowMs));
 		if (snapshotBlocksChanged(previousCredentials, credentials)) this.#invalidateUsageCache();
 		if (protectNewBlocks) this.#protectNewSnapshotBlocks(previousCredentials, credentials, nowMs);
 		this.#snapshot = { ...snapshot, credentials };
 		this.#generation = generation;
 		this.#snapshotReceivedAt = nowMs;
-		const onSnapshot = this.#onSnapshot;
-		if (!onSnapshot) return;
-		try {
-			onSnapshot(this.#snapshot, generation);
-		} catch (error) {
-			logger.debug("auth-broker snapshot callback failed", { error: String(error) });
-		}
 	}
 	#protectNewSnapshotBlocks(previous: readonly SnapshotEntry[], next: readonly SnapshotEntry[], nowMs: number): void {
 		const previousBlocksByKey = new Map<string, string>();
@@ -383,6 +407,29 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		generation: number,
 		serverNowMs: number,
 	): void {
+		const rawIndex = this.#rawSnapshot.credentials.findIndex(candidate => candidate.id === entry.id);
+		const rawCredentials =
+			rawIndex === -1
+				? [...this.#rawSnapshot.credentials, entry]
+				: this.#rawSnapshot.credentials.map((candidate, index) => (index === rawIndex ? entry : candidate));
+		this.#rawSnapshot = {
+			...this.#rawSnapshot,
+			generation,
+			serverNowMs,
+			refresher,
+			credentials: rawCredentials,
+		};
+		if (
+			!isCredentialEligible(
+				entry.provider,
+				entry.credential as AuthCredential,
+				this.#accountAllowlist,
+				entry.identityKey,
+			)
+		) {
+			this.#removeFilteredStreamCredential(entry.id, refresher, generation, serverNowMs);
+			return;
+		}
 		const incoming = this.#normalizeSnapshotEntryBlocks(entry, Date.now());
 		const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === incoming.id);
 		const previousBlocks = index === -1 ? undefined : this.#snapshot.credentials[index]?.blocks;
@@ -398,13 +445,24 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#snapshotReceivedAt = Date.now();
 	}
 
-	#removeStreamCredential(id: number, refresher: RefresherSchedule, generation: number, serverNowMs: number): void {
+	#removeFilteredStreamCredential(
+		id: number,
+		refresher: RefresherSchedule,
+		generation: number,
+		serverNowMs: number,
+	): void {
 		const removed = this.#snapshot.credentials.find(entry => entry.id === id);
 		if (removed?.blocks && removed.blocks.length > 0) this.#invalidateUsageCache();
 		const credentials = this.#snapshot.credentials.filter(entry => entry.id !== id);
 		this.#snapshot = { ...this.#snapshot, generation, serverNowMs, refresher, credentials };
 		this.#generation = generation;
 		this.#snapshotReceivedAt = Date.now();
+	}
+
+	#removeStreamCredential(id: number, refresher: RefresherSchedule, generation: number, serverNowMs: number): void {
+		const credentials = this.#rawSnapshot.credentials.filter(entry => entry.id !== id);
+		this.#rawSnapshot = { ...this.#rawSnapshot, generation, serverNowMs, refresher, credentials };
+		this.#removeFilteredStreamCredential(id, refresher, generation, serverNowMs);
 	}
 
 	/** Re-hydrate the in-memory snapshot from the broker. */
@@ -677,10 +735,16 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				.map(entry => [entry.id, entry.blocks] as const),
 		);
 		const others = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
-		const incoming = entries.map(entry => credentialEntryWithBlocks(entry, existingBlocks.get(entry.id)));
+		const incoming = entries
+			.filter(entry => isCredentialEligible(provider, entry.credential, this.#accountAllowlist, entry.identityKey))
+			.map(entry => credentialEntryWithBlocks(entry, existingBlocks.get(entry.id)));
 		this.#snapshot = { ...this.#snapshot, credentials: [...others, ...incoming] };
 	}
 	#applyCredentialEntry(entry: AuthCredentialSnapshotEntry): void {
+		if (!isCredentialEligible(entry.provider, entry.credential, this.#accountAllowlist, entry.identityKey)) {
+			this.#removeCredentialById(entry.id);
+			return;
+		}
 		const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === entry.id);
 		const existingBlocks = index === -1 ? undefined : this.#snapshot.credentials[index]?.blocks;
 		const incoming = credentialEntryWithBlocks(entry, existingBlocks);
@@ -845,6 +909,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (entry.credential.type !== "oauth") {
 			throw new AIError.AuthBrokerError(`Broker returned non-OAuth credential for id=${credentialId}`);
 		}
+		this.#applyCredentialEntry(entry);
 		const refreshed = entry.credential;
 		return {
 			access: refreshed.access,

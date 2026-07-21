@@ -15,7 +15,7 @@ import {
 	MAIN_CONFIG_FILENAMES,
 } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
-import { AuthStorage } from "../auth-storage";
+import { type AuthAccountAllowlist, AuthStorage } from "../auth-storage";
 import * as AIError from "../error";
 import { AuthBrokerClient } from "./client";
 import { RemoteAuthCredentialStore } from "./remote-store";
@@ -112,6 +112,53 @@ async function readConfigYaml(agentDir: string): Promise<ConfigSnapshot> {
 	return {};
 }
 
+/**
+ * Load the process launch's OAuth account policy. An unset variable means no
+ * restrictions; once set, every read or validation failure is fatal so a
+ * broken policy can never silently broaden credential access.
+ */
+export async function resolveAuthAccountAllowlist(): Promise<AuthAccountAllowlist | undefined> {
+	const filePath = process.env.OMP_AUTH_ACCOUNT_ALLOWLIST_FILE;
+	if (filePath === undefined) return undefined;
+	if (filePath.trim() === "") {
+		throw new AIError.ValidationError("OMP_AUTH_ACCOUNT_ALLOWLIST_FILE must name a JSON file");
+	}
+
+	let raw: string;
+	try {
+		raw = await Bun.file(filePath).text();
+	} catch (error) {
+		throw new AIError.ValidationError(
+			`Unable to read OMP_AUTH_ACCOUNT_ALLOWLIST_FILE (${filePath}): ${String(error)}`,
+		);
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		throw new AIError.ValidationError(
+			`Invalid JSON in OMP_AUTH_ACCOUNT_ALLOWLIST_FILE (${filePath}): ${String(error)}`,
+		);
+	}
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new AIError.ValidationError(
+			`Invalid OMP_AUTH_ACCOUNT_ALLOWLIST_FILE (${filePath}): expected a JSON object mapping providers to string arrays`,
+		);
+	}
+
+	const accountAllowlist = new Map<string, ReadonlySet<string>>();
+	for (const [provider, identities] of Object.entries(parsed)) {
+		if (!Array.isArray(identities) || identities.some(identity => typeof identity !== "string")) {
+			throw new AIError.ValidationError(
+				`Invalid OMP_AUTH_ACCOUNT_ALLOWLIST_FILE (${filePath}): provider ${JSON.stringify(provider)} must map to a string array`,
+			);
+		}
+		accountAllowlist.set(provider, new Set(identities));
+	}
+	return accountAllowlist;
+}
+
 function resolveSnapshotTtlMs(): number {
 	const raw = process.env.OMP_AUTH_BROKER_SNAPSHOT_TTL_MS;
 	if (raw === undefined) return DEFAULT_SNAPSHOT_CACHE_TTL_MS;
@@ -177,6 +224,7 @@ export async function resolveAuthBrokerConfig(
  */
 export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = {}): Promise<AuthStorage> {
 	const agentDir = options.agentDir ?? getAgentDir();
+	const accountAllowlist = await resolveAuthAccountAllowlist();
 	const brokerConfig = await resolveAuthBrokerConfig({
 		agentDir,
 		configValueResolver: options.configValueResolver,
@@ -220,16 +268,18 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 					status: initialResult.status,
 				});
 			initialSnapshot = initialResult.snapshot;
-			persist?.(initialSnapshot);
 		}
+		persist?.(initialSnapshot);
 		const store = new RemoteAuthCredentialStore({
 			client,
 			initialSnapshot,
 			onSnapshot: persist,
+			accountAllowlist,
 		});
 		const storage = new AuthStorage(store, {
 			configValueResolver: options.configValueResolver,
 			sourceLabel: options.sourceLabel ?? `broker ${brokerConfig.url}`,
+			accountAllowlist,
 		});
 		await storage.reload();
 		return storage;
@@ -239,6 +289,7 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 	const storage = await AuthStorage.create(dbPath, {
 		configValueResolver: options.configValueResolver,
 		sourceLabel: options.sourceLabel ?? `local ${dbPath}`,
+		accountAllowlist,
 	});
 	await storage.reload();
 	return storage;

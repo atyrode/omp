@@ -2,11 +2,28 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import {
+	type AuthAccountAllowlist,
+	type AuthCredentialStore,
+	AuthStorage,
+	type OAuthCredential,
+	resolveCredentialIdentityKey,
+	SqliteAuthCredentialStore,
+} from "@oh-my-pi/pi-ai/auth-storage";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { removeWithRetries } from "../../utils/src/temp";
 
 const PROVIDER = "unit-oauth-identity";
+
+function oauthCredential(accountId?: string, expires = Date.now() + 60 * 60_000): OAuthCredential {
+	return {
+		type: "oauth",
+		access: `access-${accountId ?? "anonymous"}`,
+		refresh: `refresh-${accountId ?? "anonymous"}`,
+		expires,
+		...(accountId ? { accountId, email: `${accountId}@example.com` } : {}),
+	};
+}
 
 describe("AuthStorage.getOAuthAccountIdentity", () => {
 	let tempDir = "";
@@ -162,5 +179,101 @@ describe("AuthStorage.getOAuthAccountIdentity", () => {
 		const after = authStorage.listStoredCredentials(PROVIDER);
 		expect(after.map(row => (row.credential.type === "oauth" ? row.credential.accountId : ""))).toEqual(["acc-b"]);
 		expect(await authStorage.removeCredential(PROVIDER, target.id)).toBe(false);
+	});
+
+	describe("account allowlist", () => {
+		test("leaves providers absent from the policy unrestricted", async () => {
+			if (!store || !authStorage) throw new Error("test setup failed");
+			await authStorage.set(PROVIDER, [oauthCredential("acc-a"), oauthCredential("acc-b")]);
+
+			const restricted = new AuthStorage(store, {
+				accountAllowlist: new Map([["some-other-provider", new Set<string>()]]),
+			});
+			await restricted.reload();
+
+			expect(restricted.listOAuthAccounts(PROVIDER).map(account => account.accountId)).toEqual(["acc-a", "acc-b"]);
+		});
+
+		test("exposes only the selected identity and defensively copies the policy", async () => {
+			if (!store || !authStorage) throw new Error("test setup failed");
+			const selected = oauthCredential("acc-b");
+			const selectedIdentity = resolveCredentialIdentityKey(PROVIDER, selected);
+			if (!selectedIdentity) throw new Error("missing test identity");
+			await authStorage.set(PROVIDER, [oauthCredential("acc-a"), selected]);
+
+			const identities = new Set([selectedIdentity]);
+			const accountAllowlist: AuthAccountAllowlist = new Map([[PROVIDER, identities]]);
+			const restricted = new AuthStorage(store, { accountAllowlist });
+			identities.add(resolveCredentialIdentityKey(PROVIDER, oauthCredential("acc-a"))!);
+			await restricted.reload();
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+				const credential = credentials[provider];
+				return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+			});
+
+			expect(restricted.listOAuthAccounts(PROVIDER).map(account => account.accountId)).toEqual(["acc-b"]);
+			expect(await restricted.getApiKey(PROVIDER)).toBe("access-acc-b");
+		});
+
+		test("an explicit empty set hides OAuth and leaves API keys visible", async () => {
+			if (!store) throw new Error("test setup failed");
+			const restricted = new AuthStorage(store, {
+				accountAllowlist: new Map([[PROVIDER, new Set<string>()]]),
+			});
+
+			await restricted.set(PROVIDER, [oauthCredential("acc-a"), { type: "api_key", key: "stored-api-key" }]);
+
+			expect(restricted.listOAuthAccounts(PROVIDER)).toEqual([]);
+			expect(restricted.listStoredCredentials(PROVIDER).map(row => row.credential.type)).toEqual(["api_key"]);
+			expect(store.listAuthCredentials(PROVIDER).map(row => row.credential.type)).toEqual(["oauth", "api_key"]);
+		});
+
+		test("excludes OAuth credentials whose canonical identity is null", async () => {
+			if (!store || !authStorage) throw new Error("test setup failed");
+			await authStorage.set(PROVIDER, oauthCredential());
+			const restricted = new AuthStorage(store, {
+				accountAllowlist: new Map([[PROVIDER, new Set(["account:any"])]]),
+			});
+
+			await restricted.reload();
+
+			expect(restricted.listStoredCredentials(PROVIDER)).toEqual([]);
+			expect(store.listAuthCredentials(PROVIDER)).toHaveLength(1);
+		});
+
+		test("never refreshes or probes excluded rows and does not mutate backing rows", async () => {
+			if (!store || !authStorage) throw new Error("test setup failed");
+			const allowed = oauthCredential("acc-allowed");
+			const excluded = oauthCredential("acc-excluded", Date.now() - 1);
+			const anonymous = oauthCredential(undefined, Date.now() - 1);
+			await authStorage.set(PROVIDER, [allowed, excluded, anonymous]);
+			const backingBefore = store.listAuthCredentials(PROVIDER);
+			const allowedIdentity = resolveCredentialIdentityKey(PROVIDER, allowed);
+			if (!allowedIdentity) throw new Error("missing test identity");
+			const refreshOAuthCredential = vi.fn(async () => {
+				throw new Error("excluded credential was refreshed");
+			});
+			const completionProbe = vi.fn(async () => ({ ok: true as const }));
+			const restricted = new AuthStorage(store, {
+				accountAllowlist: new Map([[PROVIDER, new Set([allowedIdentity])]]),
+				refreshOAuthCredential,
+			});
+			await restricted.reload();
+
+			const health = await restricted.checkCredentials({ completionProbe });
+			const excludedRow = backingBefore.find(
+				row => row.credential.type === "oauth" && row.credential.accountId === "acc-excluded",
+			);
+			if (!excludedRow) throw new Error("missing excluded test row");
+			await expect(restricted.forceRefreshCredentialById(excludedRow.id)).rejects.toThrow(
+				`No credential with id=${excludedRow.id}`,
+			);
+
+			expect(health.map(result => result.accountId)).toEqual(["acc-allowed"]);
+			expect(completionProbe).toHaveBeenCalledTimes(1);
+			expect(refreshOAuthCredential).not.toHaveBeenCalled();
+			expect(store.listAuthCredentials(PROVIDER)).toEqual(backingBefore);
+			expect(restricted.exportSnapshot().credentials.map(entry => entry.identityKey)).toEqual([allowedIdentity]);
+		});
 	});
 });
