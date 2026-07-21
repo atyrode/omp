@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore, type UsageReport } from "@oh-my-pi/pi-ai";
 import {
 	AuthBrokerClient,
 	type AuthBrokerServerHandle,
@@ -160,5 +160,42 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		const rawIdentities = callbacks.at(-1)?.credentials.map(entry => entry.identityKey);
 		expect(rawIdentities).toHaveLength(2);
 		expect(rawIdentities).toContain(allowedIdentity);
+	});
+
+	test("filters aggregate usage reports through the immutable account allowlist", async () => {
+		storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initialResult = await client.fetchSnapshot();
+		if (initialResult.status !== 200) throw new Error("expected initial snapshot");
+		const allowedIdentity = initialResult.snapshot.credentials.find(
+			entry => entry.credential.type === "oauth" && entry.credential.email === "a@example.com",
+		)?.identityKey;
+		if (!allowedIdentity) throw new Error("expected allowed credential identity");
+
+		const reports: UsageReport[] = [
+			{ provider: "anthropic", fetchedAt: Date.now(), limits: [], metadata: { email: "a@example.com" } },
+			{ provider: "anthropic", fetchedAt: Date.now(), limits: [], metadata: { email: "b@example.com" } },
+			{ provider: "anthropic", fetchedAt: Date.now(), limits: [] },
+		];
+		vi.spyOn(client, "fetchUsage").mockResolvedValue({ generatedAt: Date.now(), reports });
+		remote = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: initialResult.snapshot,
+			streamSnapshots: false,
+			accountAllowlist: new Map([["anthropic", new Set([allowedIdentity])]]),
+		});
+
+		const visible = await remote.fetchUsageReports();
+
+		expect(visible?.map(report => report.metadata?.email)).toEqual(["a@example.com"]);
+
+		remote.close();
+		remote = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: initialResult.snapshot,
+			streamSnapshots: false,
+			accountAllowlist: new Map([["anthropic", new Set()]]),
+		});
+		expect(await remote.fetchUsageReports()).toEqual([]);
 	});
 });

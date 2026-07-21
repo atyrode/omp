@@ -924,13 +924,28 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	/**
 	 * Store-level hook consumed by `AuthStorage.fetchUsageReports()` — proxies
-	 * to the broker's `/v1/usage` endpoint. The broker's egress IP isn't
-	 * rate-limited by Anthropic's per-IP `/usage` cap the way a heavy
-	 * residential laptop is, so all credentials surface every cycle.
+	 * to the broker's `/v1/usage` endpoint, then applies this session's immutable
+	 * account policy. The broker remains aggregate; only the client view is
+	 * narrowed, using report identity metadata rather than provider-level
+	 * fallback so an excluded sibling account can never reappear in `/usage`.
 	 */
 	async fetchUsageReports(signal?: AbortSignal): Promise<UsageReport[] | null> {
 		const reports = await this.#raceWithSignal(this.#loadUsageReports(), signal);
-		return reports ? this.#applyUsageOverlays(reports) : null;
+		if (!reports) return null;
+		return this.#filterUsageReports(this.#applyUsageOverlays(reports));
+	}
+
+	#filterUsageReports(reports: UsageReport[]): UsageReport[] {
+		if (this.#accountAllowlist.size === 0) return reports;
+		return reports.filter(report => {
+			if (!this.#accountAllowlist.has(report.provider)) return true;
+			return this.#snapshot.credentials.some(
+				entry =>
+					entry.provider === report.provider &&
+					entry.credential.type === "oauth" &&
+					reportMatchesCredentialStrict(report, entry.credential),
+			);
+		});
 	}
 
 	/**
@@ -1171,6 +1186,21 @@ function findMatchingReportIndex(reports: UsageReport[], overlay: UsageReport): 
 		if (reportMatchesIdentity(candidate.report, accountId, email, projectId)) return candidate.index;
 	}
 	return -1;
+}
+
+function reportMatchesCredentialStrict(report: UsageReport, credential: OAuthCredential): boolean {
+	const metadata = (report.metadata ?? {}) as Record<string, unknown>;
+	const reportOrg = readMetadataString(metadata, "orgId")?.toLowerCase();
+	const credentialOrg = credential.orgId?.trim().toLowerCase();
+	if (reportOrg !== credentialOrg) return false;
+
+	const accountId = credential.accountId?.trim().toLowerCase();
+	const email = credential.email?.trim().toLowerCase();
+	const projectId = credential.projectId?.trim().toLowerCase();
+	if (accountId || email || projectId) {
+		return reportMatchesIdentity(report, accountId, email, projectId);
+	}
+	return credentialOrg !== undefined;
 }
 
 function reportMatchesIdentity(
