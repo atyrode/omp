@@ -131,4 +131,34 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(callbacks[0].generation).toBe(refreshed.generation);
 		expect(callbacks[0].snapshot).toEqual(refreshed);
 	});
+
+	test("filters broker snapshots and SSE entries without narrowing the shared snapshot callback", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initialResult = await client.fetchSnapshot();
+		if (initialResult.status !== 200) throw new Error("expected initial snapshot");
+		const allowedIdentity = initialResult.snapshot.credentials[0]?.identityKey;
+		if (!allowedIdentity) throw new Error("expected initial credential identity");
+		const identities = new Set([allowedIdentity]);
+		const callbacks: SnapshotResponse[] = [];
+		remote = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: initialResult.snapshot,
+			accountAllowlist: new Map([["anthropic", identities]]),
+			onSnapshot: snapshot => callbacks.push(snapshot),
+		});
+		identities.add("identity-added-after-construction");
+
+		expect(remote.snapshot.credentials.map(entry => entry.identityKey)).toEqual([allowedIdentity]);
+		const initialGeneration = remote.snapshot.generation;
+
+		storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		await waitUntil(() => remote!.snapshot.generation > initialGeneration);
+		expect(remote.snapshot.credentials.map(entry => entry.identityKey)).toEqual([allowedIdentity]);
+
+		await remote.refreshSnapshot();
+		expect(remote.snapshot.credentials.map(entry => entry.identityKey)).toEqual([allowedIdentity]);
+		const rawIdentities = callbacks.at(-1)?.credentials.map(entry => entry.identityKey);
+		expect(rawIdentities).toHaveLength(2);
+		expect(rawIdentities).toContain(allowedIdentity);
+	});
 });
