@@ -2,12 +2,6 @@
 
 ## [Unreleased]
 
-## [17.0.7] - 2026-07-21
-
-### Fixed
-
-- Fixed Portkey/gateway custom models whose ids start with `@` (e.g. `@modal/GLM-5-2-FP8`) being rewritten to unrelated bundled wire ids (e.g. `glm-5-2`), which caused `400` responses requiring `x-portkey-config` or `x-portkey-provider`.
-
 ## [17.0.8] - 2026-07-22
 
 ### Added
