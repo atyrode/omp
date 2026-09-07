@@ -801,6 +801,7 @@ export class TUI extends Container {
 	#forceViewportRepaintOnNextRender = false;
 	#hasEverRendered = false;
 	#stopped = false;
+	#started = false;
 	#cancelPostmortemRestore?: () => void;
 	/** True between a `deferInput` start() and enableInput(). */
 	#inputDeferred = false;
@@ -1089,6 +1090,7 @@ export class TUI extends Container {
 	}
 
 	start(options?: TUIStartOptions): void {
+		this.#started = false;
 		this.#stopped = false;
 		this.#debugPaint = undefined;
 		this.#debugServer?.stop();
@@ -1148,6 +1150,7 @@ export class TUI extends Container {
 				// Startup listeners are feature hooks; one broken hook must not prevent rendering.
 			}
 		}
+		this.#started = !this.#stopped;
 		this.terminal.hideCursor();
 		this.#recordHardwareCursorHidden();
 		if (!this.#inputDeferred) {
@@ -1463,8 +1466,20 @@ export class TUI extends Container {
 		this.#queryCellSize();
 	}
 
+	/**
+	 * Run a feature hook on each start, or immediately when already started.
+	 * Hooks registered during startup join that start's notification pass.
+	 */
 	addStartListener(listener: StartListener): () => void {
+		const registered = this.#startListeners.has(listener);
 		this.#startListeners.add(listener);
+		if (this.#started && !registered) {
+			try {
+				listener();
+			} catch {
+				// Match startup notification: a broken feature hook must not prevent rendering.
+			}
+		}
 		return () => {
 			this.#startListeners.delete(listener);
 		};
@@ -1634,6 +1649,7 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		this.#started = false;
 		this.#cancelPostmortemRestore?.();
 		this.#cancelPostmortemRestore = undefined;
 		this.#debugServer?.stop();

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { EnhancedPasteController } from "@oh-my-pi/pi-coding-agent/utils/enhanced-paste";
+import { TUI } from "@oh-my-pi/pi-tui";
+import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
 
 const ST = "\x1b\\";
 const BEL = "\x07";
@@ -10,6 +12,41 @@ function packet(metadata: string, payload?: string): string {
 }
 
 describe("EnhancedPasteController", () => {
+	it("opts into image paste after prepaint, once per start, until unsubscribed", () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const tui = new TUI(terminal);
+		const writes: string[] = [];
+		const controller = new EnhancedPasteController({
+			write: data => {
+				writes.push(data);
+				terminal.write(data);
+			},
+			pasteText: () => {},
+			pasteImage: () => {},
+			showStatus: () => {},
+		});
+
+		try {
+			// The bare CLI prepaints before InputController installs this hook.
+			tui.start({ deferInput: true });
+			const unsubscribe = tui.addStartListener(() => controller.enable());
+			expect(writes).toEqual(["\x1b[?5522h"]);
+			tui.enableInput();
+			expect(writes).toEqual(["\x1b[?5522h"]);
+
+			tui.stop();
+			tui.start();
+			expect(writes).toEqual(["\x1b[?5522h", "\x1b[?5522h"]);
+
+			unsubscribe();
+			tui.stop();
+			tui.start();
+			expect(writes).toEqual(["\x1b[?5522h", "\x1b[?5522h"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("requests image data from an OSC 5522 paste event and preserves chunk boundaries", () => {
 		const writes: string[] = [];
 		const pastedImages: Array<{ data: string; mimeType: string }> = [];

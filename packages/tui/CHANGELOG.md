@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed enhanced image paste being unavailable after cold startup until the terminal was restarted.
+
 ## [18.1.14] - 2026-09-07
 
 ### Fixed
