@@ -398,6 +398,8 @@ export interface CreateAgentSessionOptions {
 
 	/** Model to use. Default: from settings, else first available */
 	model?: Model;
+	/** Role identity of an explicitly selected model, retained for new-session retry routing. */
+	modelRole?: string;
 	/**
 	 * Allow an explicit {@link model} to be rebound to its same-selector registry
 	 * entry after initial background discovery. The CLI enables this for models
@@ -1537,6 +1539,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}),
 	);
 	let model = options.model;
+	let initialModelRole = options.modelRole;
 	let modelFallbackMessage: string | undefined;
 	let initialRetryFallback: InitialRetryFallbackState | undefined;
 	// Identify session model strings to restore in fallback order. We do an
@@ -2551,6 +2554,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					selectedExplicitThinkingLevel = true;
 				}
 				let authFallbackUsed = false;
+				initialModelRole = options.modelRole;
 				if (options.modelPatternAuthFallback) {
 					const primaryKey = await modelRegistry.getApiKey(primary.model);
 					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
@@ -2566,6 +2570,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 								selectedThinkingLevel = fallback.thinkingLevel;
 								selectedExplicitThinkingLevel = fallback.explicitThinkingLevel;
 								authFallbackUsed = true;
+								initialModelRole = undefined;
 							}
 						}
 					}
@@ -2616,6 +2621,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							}
 						}
 						settings.override("retry.fallbackChains", fallbackChains);
+						initialModelRole = options.modelPatternFallbackRole;
 					}
 				}
 				model = selectedModel;
@@ -3635,7 +3641,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		} else {
 			// Save initial model, thinking level, and service tier for new sessions so they can be restored on resume.
 			if (model) {
-				sessionManager.appendModelChange(`${model.provider}/${model.id}`);
+				sessionManager.appendModelChange(`${model.provider}/${model.id}`, initialModelRole);
 			}
 			if (!autoThinking) {
 				// Do not write the `auto` selector before the first turn resolves; auto

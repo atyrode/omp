@@ -3335,6 +3335,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				getApiKey: options.getApiKey,
 				settings: subagentSettings,
 				model,
+				modelRole: authFallbackUsed ? undefined : (retryFallbackRole ?? modelRole),
 				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
 				modelPatternAuthFallback:
 					model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
